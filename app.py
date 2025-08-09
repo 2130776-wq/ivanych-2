@@ -9,28 +9,28 @@ from openai import OpenAI
 
 # ---------- Конфигурация ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 app = Flask(__name__)
 CORS(app)
 
-# ---------- Данные каталога ----------
-DATA: List[Dict[str, Any]] = []
-PRODUCTS: List[Dict[str, Any]] = []  # если нужен второй список
-
 ROOT = os.path.dirname(__file__)
 PATH_JSON = os.path.join(ROOT, "1.json")
 
+ARTICLE_RX = re.compile(r"^(100|104|106|108|250)-\d{3}$", re.IGNORECASE)
+
+# ---------- Данные каталога ----------
+DATA: List[Dict[str, Any]] = []
+
 def load_data() -> None:
-    global DATA, PRODUCTS
+    global DATA
     try:
         with open(PATH_JSON, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        # Приводим к списку словарей (на случай разной структуры)
         if isinstance(raw, list):
             DATA = raw
         elif isinstance(raw, dict):
-            vals = []
+            vals: List[Dict[str, Any]] = []
             for v in raw.values():
                 if isinstance(v, list):
                     vals.extend(v)
@@ -73,15 +73,61 @@ def find_by_article(query: str) -> Dict[str, Any] | None:
         for k, v in rec.items():
             if k and norm(k) in candidate_keys and norm(v) == q:
                 return rec
-    # запасной вариант: проверяем в слитном тексте записи
     for rec in DATA:
         if q in norm(record_text(rec)):
             return rec
     return None
 
-ARTICLE_RX = re.compile(r"^(100|104|106|108|250)-\d{3}$")
+def pretty_rec(rec: Dict[str, Any]) -> str:
+    name = rec.get("name") or rec.get("наименование") or rec.get("title")
+    article = rec.get("article") or rec.get("артикул") or rec.get("sku") or rec.get("code")
+    price = rec.get("price") or rec.get("цена")
+    parts = []
+    if name:    parts.append(f"Наименование: {name}")
+    if article: parts.append(f"Артикул: {article}")
+    if price:   parts.append(f"Цена: {price}")
+    return "\n".join(parts) if parts else json.dumps(rec, ensure_ascii=False)
 
-# ---------- Маршруты ----------
+# ---------- Быстрые ответы (FAQ-правила) ----------
+def quick_reply(user_text: str) -> str | None:
+    t = user_text.lower().strip()
+
+    # 1) доставка / отгрузка
+    if any(x in t for x in ["доставка", "доставку", "отправите", "отгрузите"]):
+        return "Доставка ТК Деловые Линии, до терминала в городе отгрузки бесплатно, далее за ваш счет или СДЭК"
+
+    # 2) есть в наличии / какое количество / ветка «ДА/НЕТ»
+    if ("есть в наличии" in t) or ("какое количество" in t):
+        return "Да, есть в наличии, хотите счёт?"
+    # Ответ «да» — без контекста считаем, что это «да, хочу счёт»
+    if t in {"да", "да.", "да!", "оформляйте", "счёт", "хочу счёт", "выставляйте счёт"}:
+        return "Заполните заявку и направьте нам по электронной почте вместе с карточкой предприятия. Почта: info@salpi.ru"
+    if t in {"нет", "нет.", "не надо", "пока нет"}:
+        return "Напрасно, коллега)"
+
+    # 3) минимальное количество
+    if "минималь" in t:  # покроет «минимальное», «минималка» и т.п.
+        return "В основном кратно 10 шт"
+
+    # 4) скидка / дисконт
+    if any(x in t for x in ["скидка", "скидки", "дисконт"]):
+        return "Зависит от количества, вам сколько?"
+
+    # 5) производство / страна
+    if any(x in t for x in ["производство", "страна"]):
+        return "Чехия, Германия"
+
+    # 6) Китай
+    if "китай" in t:
+        return "Нет"
+
+    # 7) трубка / шланг / рвд
+    if any(x in t for x in ["трубка", "шланг", "рвд"]):
+        return "У нас есть трубка 6×1,5 мм, код 100-003-25. Есть шланг высокого давления до 800 bar, наружный диаметр 8,6 мм, стенка 2,3 мм, код 100-002"
+
+    return None
+
+# ---------- Роуты ----------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "records": len(DATA)})
@@ -94,75 +140,53 @@ def chat():
         if not user_message:
             return jsonify({"reply": "Пустой запрос."})
 
-        # 1) Быстрый путь: артикул/код
-        #    Сначала проверим шаблон вида 100-xxx/106-xxx и т.п.
-        rx = ARTICLE_RX.search(user_message)
-        if rx:
-            rec = find_by_article(rx.group(0))
+        # A) Моментальные ответы по правилам
+        qr = quick_reply(user_message)
+        if qr:
+            return jsonify({"reply": qr})
+
+        # B) Быстрый путь по коду (100/104/106/108/250-xxx)
+        if ARTICLE_RX.match(user_message):
+            rec = find_by_article(user_message)
             if rec:
                 return jsonify({"reply": pretty_rec(rec)})
             else:
                 return jsonify({"reply": "Код распознан, но в базе такого артикула нет."})
 
-        # затем обычный поиск по введённой строке
+        # C) Поиск по базе без точного кода
         rec = find_by_article(user_message)
         if rec:
             return jsonify({"reply": pretty_rec(rec)})
 
-        # 2) Консультант: вопрос НЕ про конкретный артикул — отвечаем GPT
-        system_prompt = (
-            "Ты — «Иваныч», технический консультант по смазочному оборудованию "
-            "(централизованные системы смазки, фитинг, шланги/трубки, гриз ниппели, распределители, "
-            "удалённые точки смазки и т. п.). "
-            "Отвечай кратко и по делу. "
-            "Если вопрос вне темы смазочного оборудования — вежливо скажи, "
-            "что консультируешь только по смазочному оборудованию."
-        )
+        # D) Консультант (GPT), если ключ задан
+        if client:
+            system_prompt = (
+                "Ты — «Иваныч», технический консультант по смазочному оборудованию "
+                "(централизованные системы смазки, фитинги, шланги/трубки, ниппели, распределители, "
+                "удалённые точки смазки и т.п.). Отвечай кратко и по делу. "
+                "Если вопрос вне темы — вежливо сообщи, что консультируешь только по смазочному оборудованию."
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ]
+            rsp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.2,
+                max_tokens=350,
+            )
+            return jsonify({"reply": rsp.choices[0].message.content.strip()})
 
-        few_shots = [
-            {"role": "user", "content": "Что такое удалённая точка смазки и зачем она нужна?"},
-            {"role": "assistant", "content": "Удалённая точка смазки — это выведенное наружу место подкачки смазки, "
-                                             "чтобы обслуживать узлы без разборки/остановки. Это ускоряет обслуживание "
-                                             "и повышает безопасность."},
-            {"role": "user", "content": "Какой диаметр трубки выбрать для централизованной смазки?"},
-            {"role": "assistant", "content": "Обычно используют 4–6 мм (наружный диаметр) для ответвлений и 8–10 мм "
-                                             "для магистралей. Окончательно — по расходу/давлению и длине трассы."},
-            {"role": "user", "content": "Сколько стоит авиабилеты в Париж?"},
-            {"role": "assistant", "content": "Я консультирую только по смазочному оборудованию."},
-        ]
-
-        messages = [{"role": "system", "content": system_prompt}] + few_shots + [
-            {"role": "user", "content": user_message}
-        ]
-
-        rsp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.2,
-            max_tokens=350,
-        )
-        reply_text = rsp.choices[0].message.content.strip()
-        return jsonify({"reply": reply_text})
+        # E) Если ключа нет — нейтральный ответ
+        return jsonify({"reply": "По базе не нашёл. Могу подсказать по подбору, уточните задачу."})
 
     except Exception as e:
         app.logger.exception("Chat error")
         return jsonify({"reply": f"Ошибка: {e}"}), 500
 
-def pretty_rec(rec: Dict[str, Any]) -> str:
-    """Формируем понятный ответ по записи каталога."""
-    # подбираем самые вероятные поля из разных вариантов
-    name = rec.get("name") or rec.get("наименование") or rec.get("title")
-    article = rec.get("article") or rec.get("артикул") or rec.get("sku") or rec.get("code")
-    price = rec.get("price") or rec.get("цена")
-    parts = []
-    if name:    parts.append(f"Наименование: {name}")
-    if article: parts.append(f"Артикул: {article}")
-    if price:   parts.append(f"Цена: {price}")
-    return "\n".join(parts) if parts else json.dumps(rec, ensure_ascii=False)
-
 # ---------- Точка входа ----------
+load_data()
+
 if __name__ == "__main__":
-    load_data()
     app.run(host="0.0.0.0", port=5000, debug=False)
-else:
-    load_data()
